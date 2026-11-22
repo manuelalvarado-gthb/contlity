@@ -31,7 +31,7 @@ from .resources.webhooks  import WebhooksResource
 from .resources.credits   import CreditsResource
 from .resources.cargas    import CargasResource
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 ENV_VAR = "CONTLITY_API_KEY"
 

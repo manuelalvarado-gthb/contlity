@@ -224,8 +224,12 @@ def _convertidor(tipo: str):
 
 # ── Conexión y cursor ─────────────────────────────────────────────────────────
 
+PAGINA = 10000   # filas por página que pide el driver
+
+
 def connect(api_key: Optional[str] = None, database: Optional[str] = None, schema: Optional[str] = None,
-            base_url: Optional[str] = None, timeout: int = 120, client: Any = None) -> "Connection":
+            base_url: Optional[str] = None, timeout: int = 120, client: Any = None,
+            page_size: int = PAGINA) -> "Connection":
     """
     Abre una conexión.
 
@@ -236,6 +240,7 @@ def connect(api_key: Optional[str] = None, database: Optional[str] = None, schem
         base_url: URL de la API (por omisión, la de producción)
         timeout:  segundos de espera por consulta
         client:   un ContlityClient ya creado (en lugar de api_key/base_url/timeout)
+        page_size: filas por página; las páginas siguientes se descargan al recorrer el cursor
     """
     if client is None:
         from .client import ContlityClient
@@ -244,7 +249,7 @@ def connect(api_key: Optional[str] = None, database: Optional[str] = None, schem
                       else ContlityClient.from_env(base_url=base_url, timeout=timeout))
         except (ValueError, EnvironmentError) as e:
             raise InterfaceError(str(e)) from e
-    return Connection(client, database, schema)
+    return Connection(client, database, schema, page_size)
 
 
 def _error(e: Exception) -> Error:
@@ -256,10 +261,12 @@ def _error(e: Exception) -> Error:
 
 
 class Connection:
-    def __init__(self, client: Any, database: Optional[str] = None, schema: Optional[str] = None):
+    def __init__(self, client: Any, database: Optional[str] = None, schema: Optional[str] = None,
+                 page_size: int = PAGINA):
         self._client = client
         self.database = database
         self.schema = schema
+        self.page_size = page_size
         self._cerrada = False
         self._catalogo: Optional[tuple[float, dict]] = None
 
@@ -301,7 +308,7 @@ class Connection:
 
     def _ejecutar(self, sql: str) -> dict:
         self._abierta()
-        body: dict = {"query": sql}
+        body: dict = {"query": sql, "page_size": self.page_size}
         if self.database:
             body["database"] = self.database
         if self.schema:
@@ -313,6 +320,19 @@ class Connection:
         if r.get("error"):
             raise ProgrammingError(r["error"])
         return r
+
+    def _pagina(self, result_id: str, n: int) -> list:
+        self._abierta()
+        try:
+            return self._client._request("GET", f"/sql/results/{result_id}/{n}")["rows"]
+        except Exception as e:
+            raise _error(e) from e
+
+    def _liberar(self, result_id: str) -> None:
+        try:
+            self._client._request("DELETE", f"/sql/results/{result_id}")
+        except Exception:
+            pass
 
     def _abierta(self) -> None:
         if self._cerrada:
@@ -327,24 +347,46 @@ class Cursor:
         self.rowcount = -1
         self._filas: list = []
         self._i = 0
+        self._conv: list = []
+        self._rid: Optional[str] = None
+        self._paginas = self._sig = 1
         self._cerrado = False
 
     def execute(self, operation: str, parameters: Any = None) -> "Cursor":
         if self._cerrado:
             raise InterfaceError("El cursor está cerrado")
+        self._soltar()
         sql = formatear(operation, parameters)
         r = self.connection._ejecutar(sql)
         cols = r.get("columns") or []
-        conv = [_convertidor(c.get("type") or "text") for c in cols]
-        filas = []
-        for fila in r.get("rows") or []:
-            if any(conv):
-                fila = [f(v) if f and v is not None else v for f, v in zip(conv, fila)]
-            filas.append(tuple(fila))
+        self._conv = [_convertidor(c.get("type") or "text") for c in cols]
         self.description = [(c["name"], c.get("type") or "text", None, None, None, None, None) for c in cols] or None
-        self._filas, self._i = filas, 0
-        self.rowcount = len(filas)
+        self._filas, self._i = self._convertir(r.get("rows") or []), 0
+        self._rid, self._paginas, self._sig = r.get("result_id"), r.get("pages") or 1, 1
+        self.rowcount = r.get("total", len(self._filas))
         return self
+
+    def _convertir(self, filas: list) -> list:
+        if not any(self._conv):
+            return [tuple(f) for f in filas]
+        return [tuple(c(v) if c and v is not None else v for c, v in zip(self._conv, f)) for f in filas]
+
+    def _llenar(self) -> bool:
+        """Descarga la siguiente página si ya se consumió la actual."""
+        if self._i < len(self._filas):
+            return True
+        if not self._rid or self._sig >= self._paginas:
+            return False
+        self._filas, self._i = self._convertir(self.connection._pagina(self._rid, self._sig)), 0
+        self._sig += 1
+        if self._sig >= self._paginas:
+            self._soltar()
+        return bool(self._filas)
+
+    def _soltar(self) -> None:
+        if getattr(self, "_rid", None):        # libera el resultado en el servidor (leído o abandonado)
+            rid, self._rid = self._rid, None
+            self.connection._liberar(rid)
 
     def executemany(self, operation: str, seq_of_parameters: Iterable[Any]) -> None:
         for p in seq_of_parameters:
@@ -352,7 +394,7 @@ class Cursor:
 
     def fetchone(self) -> Optional[tuple]:
         self._con_resultado()
-        if self._i >= len(self._filas):
+        if not self._llenar():
             return None
         self._i += 1
         return self._filas[self._i - 1]
@@ -360,17 +402,24 @@ class Cursor:
     def fetchmany(self, size: Optional[int] = None) -> list[tuple]:
         self._con_resultado()
         n = self.arraysize if size is None else size
-        out = self._filas[self._i:self._i + n]
-        self._i += len(out)
+        out: list = []
+        while len(out) < n and self._llenar():
+            parte = self._filas[self._i:self._i + n - len(out)]
+            self._i += len(parte)
+            out.extend(parte)
         return out
 
     def fetchall(self) -> list[tuple]:
         self._con_resultado()
-        out = self._filas[self._i:]
-        self._i = len(self._filas)
+        out: list = []
+        while self._llenar():
+            out.extend(self._filas[self._i:])
+            self._i = len(self._filas)
         return out
 
     def close(self) -> None:
+        if not self._cerrado:
+            self._soltar()
         self._cerrado = True
         self._filas = []
 

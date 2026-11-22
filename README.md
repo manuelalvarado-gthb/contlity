@@ -271,6 +271,22 @@ La conexión queda en una base (por omisión, la principal). Los esquemas son lo
 del núcleo están en el esquema `contlity` y se consultan sin calificar (`FROM comprobantes`).
 `client.sql.catalog(database)` devuelve el mismo catálogo (esquemas, tablas, columnas y tipos).
 
+Los resultados grandes llegan por páginas de 10,000 filas mientras recorres el cursor (hasta 5 millones
+de filas por consulta). Sin el driver:
+
+```python
+for fila in client.sql.iter_rows("SELECT * FROM conceptos"):     # memoria acotada
+    ...
+r = client.sql.execute("SELECT * FROM conceptos", page_size=10000)
+siguiente = client.sql.page(r["result_id"], 1)                   # páginas 1 … r["pages"]-1, 24 horas
+```
+
+## Driver JDBC (DBeaver, DataGrip, Tableau)
+
+[`contlity-jdbc.jar`](https://github.com/manuelalvarado-gthb/contlity/releases/latest/download/contlity-jdbc.jar) — Java 11+, sin dependencias, solo lectura.
+Clase `cloud.techmx.contlity.jdbc.ContlityDriver`, URL `jdbc:contlity:///despacho`, usuario cualquiera
+y la API key como contraseña. Detalles en [`jdbc/README.md`](jdbc/README.md).
+
 ## Configuración avanzada
 
 ```python
@@ -292,6 +308,8 @@ client = ContlityClient(
 | GET | `/v1/cfdis/{uuid}` | CFDI por UUID | 0 |
 | POST | `/v1/sql` | Ejecutar SQL | 1–2 |
 | GET | `/v1/catalog` | Esquemas, tablas y columnas visibles | 0 |
+| GET | `/v1/sql/results/{id}/{page}` | Página de un resultado (page_size) | 0 |
+| DELETE | `/v1/sql/results/{id}` | Liberar un resultado | 0 |
 | GET | `/v1/stages` | Stages visibles | 0 |
 | GET/POST | `/v1/stages/{base}/{esquema}/{stage}/files` | Listar / subir archivos | 0 |
 | POST | `/v1/copy` | COPY INTO tabla desde un stage | 1–2 |

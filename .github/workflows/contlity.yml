@@ -1,5 +1,6 @@
-# Publica el paquete «contlity» en PyPI al empujar una etiqueta vX.Y.Z.
-# PyPI confía en este flujo (publicador de confianza / OIDC): no hay tokens ni contraseñas.
+# Publica en cada etiqueta vX.Y.Z:
+#   - el paquete «contlity» en PyPI (publicador de confianza / OIDC: sin tokens ni contraseñas)
+#   - el driver JDBC (jdbc/) como contlity-jdbc.jar en el release de GitHub
 name: contlity
 
 on:
@@ -8,11 +9,11 @@ on:
   workflow_dispatch:
 
 jobs:
-  construir:
+  python:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Construir
@@ -33,20 +34,56 @@ jobs:
           assert e.dialect.name == "contlity"
           print("contlity", contlity.__version__, "ok")
           PY
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
-          name: dist
+          name: python
           path: dist/
 
-  publicar:
-    needs: construir
+  jdbc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Construir
+        run: |
+          VER=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)
+          cd jdbc && ./build.sh "$VER"
+          java -jar "dist/contlity-jdbc-$VER.jar" | grep -q "Contlity JDBC $VER"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: jdbc
+          path: jdbc/dist/
+
+  pypi:
+    needs: [python, jdbc]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
-          name: dist
+          name: python
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  release:
+    needs: [pypi]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artefactos/
+      - name: Release de GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --title "contlity $GITHUB_REF_NAME" \
+            --notes "SDK de Python: pip install contlity==${GITHUB_REF_NAME#v}. Driver JDBC: contlity-jdbc.jar (Java 11+, sin dependencias). Guía: https://contlity.tech-mx.cloud/docs/sdk" \
+            artefactos/jdbc/*.jar artefactos/python/*
